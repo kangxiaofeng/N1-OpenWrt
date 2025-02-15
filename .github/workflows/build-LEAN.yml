@@ -6,133 +6,135 @@ on:
 env:
   REPO_URL: https://github.com/coolsnowwolf/lede  
   REPO_BRANCH: master 
-  TARGET_DEVICE: phicomm_n1 
-  CCACHE_DIR: ${{ github.workspace  }}/openwrt/ccache 
+  CONFIG_FILE: N1-LEDE/.config 
+  DIY_SH: N1-LEDE/diy.sh  
+  FILES: N1-LEDE/files 
   TZ: Asia/Shanghai 
+  CCACHE_DIR: /tmp/ccache  # 新增缓存目录变量 
  
 jobs:
   build:
     runs-on: ubuntu-22.04 
-    timeout-minutes: 240 
+    strategy:
+      fail-fast: false  # 允许单个步骤失败不影响整体流程 
  
     steps:
-    # ==== 系统性能监控 ====
-    - name: Check machine configuration 
+    # 阶段1：系统信息检查与空间优化 
+    - name: System diagnostics 
       run: |
-        echo "⚠️ 性能警告：当前服务器CPU型号 $(lscpu | grep 'Model name' | cut -d':' -f2 | xargs)"
-        echo "可用内存：$(free -h | awk '/Mem/{print $4}')"
-        echo "建议策略："
-        echo "1. 避免同时启用Node.js/GoLang 编译"
-        echo "2. 优先选择预编译包（CONFIG_ALL_NONSHARED=n）"
-        echo "3. 禁用DEBUG选项（CONFIG_DEBUG=n）"
- 
-    # ==== 智能磁盘管理 ====
-    - name: Optimize Disk Space (Smart Mode)
-      uses: "hugoalh/disk-space-optimizer-ghaction@v0.8.1"
+        echo "=== Hardware Summary ===" 
+        lscpu | grep -E 'Model name|Socket|Core'
+        free -h 
+        df -hT 
+        
+    - name: Space optimization 
+      uses: easimon/maximize-build-space@master 
       with:
-        operate_sudo: true 
-        general_exclude: |-
-          ^(GCC|Clang|LLVM|Rust)$ 
-        apt_prune: true 
-        docker_clean: true 
-        swap_size_mb: 4096  # 增加swap应对内存不足 
+        root-reserve-mb: 8192 
+        swap-size-mb: 4096 
+        remove-dotnet: true 
+        remove-android: true 
  
-    # ==== 四级缓存体系 ====
-    - name: Cache system 
-      uses: actions/cache@v3 
-      with:
-        path: |
-          openwrt/ccache 
-          openwrt/dl 
-          openwrt/.git 
-          openwrt/tmp 
-        key: ${{ runner.os  }}-n1-${{ hashFiles('**/feeds.conf.default')  }}-v3 
-        restore-keys: |
-          ${{ runner.os  }}-n1-
+    # 阶段2：依赖安装与环境配置 
+    - name: Setup build environment 
+      env:
+        DEBIAN_FRANCH: bookworm 
+        DEBIAN_FRONTEND: noninteractive 
+      run: |
+        sudo apt-get -yqq update 
+        sudo apt-get -yqq install \
+          build-essential clang flex g++ gawk gcc-multilib gettext git \
+          libncurses5-dev libssl-dev python3-distutils rsync unzip zlib1g-dev \
+          file wget qemu-utils rename time gn libfuse-dev ccache 
+        sudo timedatectl set-timezone "$TZ"
+        echo "/tmp/ccache" | sudo tee -a /etc/fstab 
  
-    # ==== 源码增量同步 ====
-    - name: Clone source code (Delta Update)
+    # 阶段3：代码管理与缓存配置 
+    - name: Repository management 
+      working-directory: ${{ github.workspace  }}
       run: |
         if [ ! -d "openwrt/.git" ]; then 
-          git clone --depth 1 --branch $REPO_BRANCH $REPO_URL openwrt 
-          cd openwrt 
-          git config pull.ff  only 
+          git clone --depth=1 --filter=blob:none $REPO_URL -b $REPO_BRANCH openwrt 
         else 
           cd openwrt 
           git reset --hard HEAD 
-          git pull --depth 100  # 保留100次commit历史 
+          git clean -fdx 
+          git pull 
         fi 
-        sed -i 's|https://github.com/coolsnowwolf/luci.git;openwrt-23.05 |https://github.com/coolsnowwolf/luci |g' feeds.conf.default  
  
-    # ==== 环境初始化 ====
-    - name: Initialize environment 
-      env:
-        DEBIAN_FRONTEND: noninteractive 
-      run: |
-        sudo timedatectl set-timezone "$TZ"
-        sudo apt update 
-        sudo apt install -y $(curl -fsSL https://is.gd/depends_ubuntu_2204  | grep -vE 'nodejs|npm')
-        sudo apt autoremove --purge -y 
+    - name: Cache configuration 
+      uses: actions/cache@v3 
+      with:
+        path: |
+          ${{ env.CCACHE_DIR }}
+          openwrt/dl 
+          openwrt/staging_dir 
+        key: ${{ runner.os  }}-n1-${{ hashFiles(env.CONFIG_FILE) }}-${{ hashFiles(env.DIY_SH) }}
  
-    # ==== 智能编译核心 ====
-    - name: Compile with AI Optimization 
-      env:
-        CCACHE_COMPRESS: 1 
-        CCACHE_MAXSIZE: 4G 
+    # 阶段4：构建流程优化 
+    - name: Feeds management 
+      working-directory: ./openwrt 
       run: |
-        cd openwrt 
-        ./scripts/feeds update -a 
-        ./scripts/feeds install -a 
+        ./scripts/feeds clean 
+        ./scripts/feeds update -a -f 
+        ./scripts/feeds install -a -f 
+ 
+    - name: Configuration setup 
+      working-directory: ./openwrt 
+      run: |
+        [ -f "../$FILES" ] && cp -rf ../$FILES .
+        [ -f "../$CONFIG_FILE" ] && cp ../$CONFIG_FILE .config 
+        chmod +x "../$DIY_SH" && "../$DIY_SH"
+        make defconfig 
+ 
+    # 阶段5：智能构建系统 
+    - name: Smart compilation 
+      working-directory: ./openwrt 
+      env:
+        CCACHE_DIR: ${{ env.CCACHE_DIR }}
+        CCACHE_MAXSIZE: 2G 
+      run: |
+        make download -j$(($(nproc)*2)) || make download -j1 
+        find dl -size -1024c -delete 
         
-        # 配置智能选择 
-        if [ -f "../$CONFIG_FILE" ]; then 
-          cp "../$CONFIG_FILE" .config 
-          make defconfig 
-        else 
-          make menuconfig  # 首次编译需要交互配置 
+        # 智能编译策略 
+        if [ -d "$CCACHE_DIR" ]; then 
+          ccache -o compression=true 
+          ccache -M $CCACHE_MAXSIZE 
+          ccache -s 
         fi 
+        
+        (time make -j$(nproc) V=s) || \
+        (make -j1 V=s || { echo "Final compilation failed"; exit 1; })
  
-        # 动态并行编译 
-        MAX_JOBS=$(($(nproc) * 3 / 4))
-        make -j$MAX_JOBS \
-          CCACHE_DIR="$CCACHE_DIR" \
-          CC="ccache gcc" \
-          CXX="ccache g++" \
-          V=s || { 
-            echo "检测到编译失败，启动降级模式..."; 
-            make -j1 V=s; 
-          }
- 
-    # ==== 固件智能打包 ====
-    - name: Smart Packaging 
+    # 阶段6：产出物处理 
+    - name: Artifact packaging 
+      if: success()
       uses: unifreq/openwrt_packit@master 
-      if: success() && !cancelled()
       env:
         PACKAGE_SOC: s905d 
-        KERNEL_AUTO_LATEST: true 
-        AUTO_FLASH: 1 
-        CUSTOM_SCRIPT: |
-          #!/bin/bash 
-          echo "正在注入N1专用优化参数..."
-          sed -i 's/192.168.1.1/192.168.2.2/g' package/base-files/files/bin/config_generate 
-          echo "root:$(openssl passwd -6 'password')" > package/base-files/files/etc/shadow 
+        KERNEL_VERSION: 5.15.148 
+        AUTO_LATEST: false 
  
-    # ==== 发布管理 ====
-    - name: Upload Release (Auto Tag)
-      uses: ncipollo/release-action@main 
+    - name: Release management 
+      if: success()
+      uses: softprops/action-gh-release@v1 
       with:
-        tag: OpenWrt_N1_$(date +'%Y%m%d-%H%M%S')
-        artifacts: /opt/openwrt_packit/output/*
+        tag_name: N1-$(date +%Y%m%d)
+        files: |
+          openwrt/bin/targets/**/*.img.gz  
+          openwrt/bin/targets/**/*.manifest 
         body: |
-          ### N1专属优化版 
-          **核心特性**：
-          - 动态CPU调度：根据服务器性能自动调整并行数 
-          - 四级缓存加速：二次编译时间缩短至首次的30%
-          - 智能回退机制：编译失败自动降级到单线程模式 
-          - 安全加固：默认启用SSH证书登录（密码：password）
+          ### 固件信息 
+          - 默认IP: 192.168.2.2 
+          - 用户名: root 
+          - 密码: password 
+          - 编译时间: $(date -u "+%Y-%m-%dT%H:%M:%SZ")
  
-    - name: Clean old releases 
-      uses: dev-drprasad/delete-older-releases@master 
-      with:
-        keep_latest: 10 
-        delete_tags: true 
+    # 阶段7：清理与维护 
+    - name: Post-cleanup 
+      if: always()
+      run: |
+        sudo rm -rf /tmp/* 
+        sudo apt-get clean 
+        docker system prune -af 
